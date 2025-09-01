@@ -1,34 +1,66 @@
-- name: Azure Login
-  uses: azure/login@v2
-  with:
-    creds: ${{ secrets.AZURE_CREDENTIALS }}
+name: Trigger auto deployment for demo-container
 
-- name: Set GHCR registry on Container App
-  shell: bash
-  env:
-    RG: ${{ secrets.RESOURCE_GROUP }}
-    APP: ${{ secrets.CONTAINER_APP_NAME }}
-    GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
-    GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-  run: |
-    for v in RG APP GHCR_USERNAME GHCR_TOKEN; do
-      if [ -z "${!v}" ]; then echo "::error::$v is empty"; exit 1; fi
-    done
-    az containerapp registry set \
-      -g "$RG" -n "$APP" \
-      --server ghcr.io \
-      --username "$GHCR_USERNAME" \
-      --password "$GHCR_TOKEN"
+env:
+  AZURE_CONTAINER_APP_NAME: demo-container
+  AZURE_GROUP_NAME: demo-container
 
-- name: Deploy image (owner must be lowercase)
-  shell: bash
-  env:
-    RG: ${{ secrets.RESOURCE_GROUP }}
-    APP: ${{ secrets.CONTAINER_APP_NAME }}
-  run: |
-    OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-    IMAGE="ghcr.io/$OWNER/azure-rag:${{ github.sha }}"
-    az containerapp update -g "$RG" -n "$APP" \
-      --image "$IMAGE" --cpu 1 --memory 2Gi --min-replicas 1
-    az containerapp ingress update -g "$RG" -n "$APP" \
-      --type external --target-port 8080 --exposed
+# When this action will be executed
+on:
+  # Automatically trigger it when detected changes in repo. Remove comments to enable
+  #push:
+  #  branches:
+  #    [ main ]
+
+  # Allow mannually trigger
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout to the branch
+        uses: actions/checkout@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+
+      - name: Log in to GitHub container registry
+        uses: docker/login-action@v1.10.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase the repo name and username
+        run: echo "REPO=${GITHUB_REPOSITORY,,}" >>${GITHUB_ENV}
+
+      - name: Build and push container image to registry
+        uses: docker/build-push-action@v2
+        with:
+          push: true
+          tags: ghcr.io/${{ env.REPO }}:${{ github.sha }}
+          file: ./Dockerfile
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Lowercase the repo name and username
+        run: echo "REPO=${GITHUB_REPOSITORY,,}" >>${GITHUB_ENV}
+
+      - name: Deploy to containerapp
+        uses: azure/CLI@v1
+        with:
+          inlineScript: |
+            az config set extension.use_dynamic_install=yes_without_prompt
+            az containerapp registry set -n ${{ env.AZURE_CONTAINER_APP_NAME }} -g ${{ env.AZURE_GROUP_NAME }} --server ghcr.io --username  ${{ github.actor }} --password ${{ secrets.PAT }}
+            az containerapp update -n ${{ env.AZURE_CONTAINER_APP_NAME }} -g ${{ env.AZURE_GROUP_NAME }} --set-env-vars OPENAI_API_TYPE=azure OPENAI_API_BASE=https://demo-alfredo-openai.openai.azure.com/ OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }} OPENAI_API_VERSION="2023-07-01-preview" SEARCH_SERVICE_NAME="https://demo-alfredo.search.windows.net" SEARCH_API_KEY=${{ secrets.SEARCH_SERVICE_API_KEY }} SEARCH_INDEX_NAME="demo-alfredo"
+            az containerapp update -n demo-container -g demo-container --cpu 2 --memory 4Gi
+            az containerapp update -n ${{ env.AZURE_CONTAINER_APP_NAME }} -g ${{ env.AZURE_GROUP_NAME }} --image ghcr.io/${{ env.REPO }}:${{ github.sha }}
